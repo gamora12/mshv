@@ -1,0 +1,91 @@
+name: MSHV Build & Tests
+on: 
+  pull_request:
+  workflow_dispatch:
+jobs:
+  infrasetup:
+    uses: ./.github/workflows/mshv-infra.yaml
+    name: MSHV Infra Setup
+    with:
+      RG: "MSHVBuild-${{ github.run_id }}"
+      SKU: "Standard_d16s_v5"
+    secrets:
+      MSHV_MI_CLIENT_ID: ${{ secrets.MSHV_MI_CLIENT_ID }}
+      MSHV_STORAGE_ACCOUNT_PATHS: ${{ secrets.MSHV_STORAGE_ACCOUNT_PATHS }}
+      MSHV_USERNAME: ${{ secrets.MSHV_USERNAME }}
+      MSHV_PASSWORD: ${{ secrets.MSHV_PASSWORD }}
+      MSHV_X86_SOURCE_PATH: ${{ secrets.MSHV_X86_SOURCE_PATH }}
+      MSHV_RUNNER_RG: ${{ secrets.MSHV_RUNNER_RG }}
+      MSHV_RUNNER: ${{ secrets.MSHV_RUNNER }}
+  build:
+    name: Build & test for MSHV crate
+    runs-on:
+      - self-hosted
+      - Linux
+    needs: infrasetup
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: AZ Login
+        run: az login --identity --client-id ${{ secrets.MSHV_MI_CLIENT_ID }}
+
+      - name: Build & Test MSHV Crate
+        env:
+          RG: "MSHVBuild-${{ github.run_id }}"
+          VM_NAME: "x86_${{ github.run_id }}"
+          USERNAME: ${{ secrets.MSHV_USERNAME }}
+          PASSWORD: ${{ secrets.MSHV_PASSWORD }}
+        run: |
+          set -e
+          echo "Retrieving VM Private IP address..."
+          PRIVATE_IP=$(az vm show -g ${RG} -n ${VM_NAME} -d --query privateIps -o tsv)
+          if [[ -z "$PRIVATE_IP" ]]; then
+            echo "ERROR: Failed to retrieve private IP address."
+            exit 1
+          fi
+          echo "Successfully retrieved private IP address."
+
+          echo "Connecting to the VM via SSH..."
+          set +x
+          sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${USERNAME}@$PRIVATE_IP << EOF
+            set -e
+            echo "Logged in successfully."
+
+            # Install Rust
+            echo "Installing Rust..."
+            curl -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable --profile default -y
+            export PATH="\$HOME/.cargo/bin:$PATH"
+            cargo --version || { echo "Cargo installation failed"; exit 1; }
+
+            # Build and test MSHV crate
+            echo "Building and testing MSHV crate..."
+            cd mshv
+            cargo build
+            cargo test
+          EOF
+          set -x
+          echo "Build and test completed successfully."
+
+  cleanup:
+    name: Cleanup
+    needs: build
+    if: always()
+    runs-on:
+    - self-hosted
+    - Linux
+    steps:
+      - name: Delete Resource Group
+        env:
+          RG: "MSHVBuild-${{ github.run_id }}"
+        run: |
+          set -e
+          echo "Checking if Resource Group exists..."
+          if az group exists --name ${RG}; then
+            echo "Deleting Resource Group: ${RG}"
+            az group delete --name ${RG} --yes --no-wait
+            echo "Resource Group deleted successfully."
+          else
+            echo "Resource Group ${RG} does not exist. Skipping deletion."
+          fi
+          echo "Cleanup process completed."
